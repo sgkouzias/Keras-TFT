@@ -115,4 +115,4 @@ The implementation follows the official TFT architecture:
 
 ## License
 
-[MIT License](LICENSE)
+[Apache License](LICENSE)
