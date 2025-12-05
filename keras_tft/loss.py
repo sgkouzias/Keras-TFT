@@ -28,11 +28,22 @@ class QuantileLoss(keras.losses.Loss):
         y_true = ops.cast(y_true, "float32")
         y_pred = ops.cast(y_pred, "float32")
         
-        if len(y_true.shape) == 2:
+        # y_pred: (Batch, Output_len, Quantiles)
+        # y_true: (Batch, Output_len, 1) or (Batch, Output_len)
+        if y_pred.shape[-1] != len(self.quantiles):
+             raise ValueError(f"Expected {len(self.quantiles)} quantiles, got {y_pred.shape[-1]}")
+        
+        if ops.ndim(y_true) == 2:
             y_true = ops.expand_dims(y_true, axis=-1)
             
-        error = y_true - y_pred
+        # Broadcast y_true to match num_quantiles
+        # (Batch, Time, 1) -> (Batch, Time, Quantiles)
+        y_true = ops.broadcast_to(y_true, ops.shape(y_pred))
+        
         loss_list = []
+        
+        # Calculate loss for each quantile
+        error = y_true - y_pred
         
         for i, q in enumerate(self.quantiles):
             q_error = error[..., i]

@@ -127,7 +127,7 @@ class GatedResidualNetwork(layers.Layer):
             if len(x.shape) == 3 and len(c.shape) == 2:
                 c = ops.expand_dims(c, axis=1)
             
-            x_in = x
+            # x_in = x # Removed unused variable
             residual = x
             
             # Feed Forward with Context
@@ -258,6 +258,12 @@ class StaticVariableSelection(layers.Layer):
                 # feat is (Batch, 1)
                 # We need to cast to int for embedding
                 feat_int = ops.cast(feat, "int32")
+
+                # Validation: Clip to vocab size to prevent out-of-bounds
+                if self.vocab_sizes: # Defensive check
+                    vocab_limit = self.vocab_sizes[cat_idx]
+                    feat_int = ops.clip(feat_int, 0, vocab_limit - 1)
+                
                 # Squeeze the last dim to get (Batch)
                 feat_int = ops.squeeze(feat_int, axis=-1)
                 
@@ -279,7 +285,9 @@ class StaticVariableSelection(layers.Layer):
         config.update({
             "num_features": self.num_features,
             "hidden_dim": self.hidden_dim,
-            "dropout_rate": self.dropout_rate
+            "dropout_rate": self.dropout_rate,
+            "categorical_indices": self.categorical_indices,
+            "vocab_sizes": self.vocab_sizes
         })
         return config
 
@@ -405,6 +413,17 @@ class MultivariateVariableSelection(layers.Layer):
                 # feat is (Batch, Time, 1) or (Batch, 1)
                 # We need to cast to int for embedding
                 feat_int = ops.cast(feat, "int32")
+                
+                # Validation: Check for invalid indices
+                # Note: This adds ops to the graph
+                # tf.debugging.assert_non_negative(feat_int, message=f"Negative index in categorical feature {i}")
+                # We assume correct preprocessing, but this check catches raw float errors
+                
+                # Validation: Clip to vocab size to prevent out-of-bounds
+                if self.vocab_sizes:
+                    vocab_limit = self.vocab_sizes[cat_idx]
+                    feat_int = ops.clip(feat_int, 0, vocab_limit - 1)
+                
                 # Squeeze the last dim to get (Batch, Time)
                 feat_int = ops.squeeze(feat_int, axis=-1)
                 
@@ -446,40 +465,100 @@ class MultivariateVariableSelection(layers.Layer):
 class InterpretableMultiHeadAttention(layers.Layer):
     """
     Interpretable Multi-Head Attention (IMHA) from TFT paper.
-    
-    Shares values (V) across heads to enable interpretability of attention weights.
-    Returns attention weights for analysis.
-    
+    Interpretable Multi-Head Attention Mechanism.
+
+    This layer implements Multi-Head Attention with a specific design that allows for proper
+    interpretation of attention weights, maintaining the output dimension equal to the model dimension
+    to facilitate residual connections.
+
     Attributes:
         num_heads (int): Number of attention heads.
-        key_dim (int): Dimension of the key/query projections.
+        key_dim (int): Dimensionality of the key/query projections per head.
+        output_dim (int): Dimensionality of the final output projection (usually hidden_dim).
         dropout (float): Dropout rate.
     """
-    def __init__(self, num_heads: int, key_dim: int, dropout: float = 0.0, **kwargs):
+    def __init__(self, num_heads: int, key_dim: int, output_dim: int, dropout: float = 0.0, **kwargs):
         """
         Initialize the InterpretableMultiHeadAttention layer.
 
         Args:
             num_heads (int): Number of attention heads.
-            key_dim (int): Dimension of the key/query projections.
-            dropout (float, optional): Dropout rate. Defaults to 0.0.
+            key_dim (int): Size of each attention head for query/key.
+            output_dim (int): Size of the final output (and value input).
+            dropout (float, optional): Dropout probability. Defaults to 0.0.
+            **kwargs: Additional layer arguments.
         """
         super().__init__(**kwargs)
         self.num_heads = num_heads
         self.key_dim = key_dim
+        self.output_dim = output_dim # Explicitly set output_dim
         self.dropout = dropout
         
         self.query_dense = layers.Dense(key_dim * num_heads)
         self.key_dense = layers.Dense(key_dim * num_heads)
         self.value_dense = layers.Dense(key_dim) # Shared value projection
         
-        self.output_dense = layers.Dense(key_dim) # Output projection
+        self.output_dense = None # Initialize in build to ensure correct output dim
         self.dropout_layer = layers.Dropout(dropout)
         
+        # We need to ensure output_dense projects back to the EXPECTED hidden dimension (e.g. 128)
+        # In the previous implementation, we projected to num_heads * key_dim.
+        # If hidden_dim=100, num_heads=3 -> key_dim=33 -> output=99 != 100.
+        # We need to know the target hidden_dim.
+        # We can accept it as an argument or infer it? 
+        # Standard Keras MHA accepts 'key_dim' but also 'value_dim' or assumes output matches input or specific arg.
+        # Here we follow the user's fix: project to self.hidden_dim.
+        # But we didn't save self.hidden_dim in __init__ properly (we set self.hidden_dim = key_dim).
+        # We should probably accept hidden_dim in __init__ to be safe, or assume the user wants 
+        # the projection to match (num_heads * key_dim) IF consistent,
+        # BUT the user explicitly requested: "Change the output projection to explicitly target hidden_dim"
+        # and checking the init sig, we don't pass hidden_dim.
+        # However, `model.py` passes `key_dim = hidden_dim // num_heads`.
+        # So we can try to recover hidden_dim if we assume the user wants to restore it?
+        # A safer bet is to accept `hidden_dim` in `__init__` if possible.
+        # Looking at `model.py` call:
+        # attn_layer = InterpretableMultiHeadAttention(
+        #     num_heads=self.num_heads, key_dim=self.hidden_dim // self.num_heads, dropout=self.dropout_rate
+        # )
+        # It does NOT pass hidden_dim.
+        # So we can't magically know '100' if we receive '33'.
+        # However, we can modify `model.py` to pass it.
+        # AND/OR we can modify `__init__` here.
+        # Let's modify `__init__` to accept `output_dim` or `hidden_dim`?
+        # OR we can assume `output_dense` size should simply be independent of key_dim*num_heads.
+        # But we need to know the size.
+        # I will modify `model.py` to pass `hidden_dim` to `InterpretableMultiHeadAttention`.
+        # And update `__init__` here to accept it.
+        # self.output_dim = kwargs.get('output_dim', key_dim * num_heads) # Moved to top
+
+
+        
     def build(self, input_shape):
-        # input_shape is dict or list of shapes for q, k, v
-        # Assuming q, k, v have same last dim for simplicity in build, 
-        # but they are projected anyway.
+        # input_shape can be a list [q_shape, k_shape, v_shape] or single shape
+        if isinstance(input_shape, list):
+            q_shape = input_shape[0] # (B, T_q, D)
+            k_shape = input_shape[1]
+            v_shape = input_shape[2]
+        else:
+            q_shape = k_shape = v_shape = input_shape
+            
+        # Build sublayers explicitly
+        # Inputs to q, k dense are (B, T, D)
+        self.query_dense.build(q_shape)
+        self.key_dense.build(k_shape)
+        self.value_dense.build(v_shape)
+        
+        # Output dense takes concatenated heads: (B, T, Num_Heads * Key_Dim)
+        # We want to project back to the hidden dimension (output_dim).
+        concat_last_dim = self.num_heads * self.key_dim
+        self.output_dense = layers.Dense(self.output_dim) 
+        
+        # We need to construct the input shape for output_dense
+        # It takes (B, T_q, H*D)
+        # Use None for Batch and Time dimensions for safety
+        output_dense_input_shape = (None, None, concat_last_dim)
+        self.output_dense.build(output_dense_input_shape)
+        
         super().build(input_shape)
         
     def call(self, query, key, value, return_attention_scores=False):
@@ -545,8 +624,10 @@ class InterpretableMultiHeadAttention(layers.Layer):
         # output is (B, H, T_q, D_v)
         # Reshape to (B, T_q, H * D_v)
         output = ops.transpose(output, (0, 2, 1, 3))
+        # Concatenate heads: (B, T_q, H, D_v) -> (B, T_q, H * D_v)
         output = ops.reshape(output, (B, T_q, self.num_heads * self.key_dim))
         
+        # Project back to key_dim (which is hidden_dim)
         output = self.output_dense(output)
         output = self.dropout_layer(output)
         
@@ -559,7 +640,8 @@ class InterpretableMultiHeadAttention(layers.Layer):
         config.update({
             "num_heads": self.num_heads,
             "key_dim": self.key_dim,
-            "dropout": self.dropout
+            "dropout": self.dropout,
+            "output_dim": self.output_dim
         })
         return config
 

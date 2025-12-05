@@ -8,32 +8,26 @@ from sklearn.preprocessing import MinMaxScaler, StandardScaler
 def preprocess_timeseries(
     file_path: str,
     forecast_horizon: int,
+    target_col: Optional[str] = None,
+    time_col: Optional[str] = None,
+    static_covariates: Optional[List[str]] = None,
+    country: str = "US",
     is_holiday: bool = False,
-    country: str = None,
     is_weekend: bool = False,
     include_friday_in_weekend: bool = False,
-    static_covariates: Optional[List[str]] = None,
     cutoff_date: Optional[str] = None
-) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, MinMaxScaler]:
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, object]:
     """
-    Preprocess time series data for the TFT model.
-
-    This function loads data, handles static covariates, performs feature engineering 
-    (holidays, weekends), scales the target variable, and splits the data into 
-    history, prediction input, and test sets.
-
+    Prepares a time series dataset for TFT training and prediction.
+    
     Args:
-        file_path (str): Path to the data file (.csv or .xlsx).
-        forecast_horizon (int): Number of steps to forecast into the future.
-        is_holiday (bool, optional): Whether to add a holiday indicator. Defaults to False.
-        country (str, optional): Country code or name for holidays (e.g., 'Greece', 'US'). 
-                                 Required if is_holiday is True. Defaults to None.
-        is_weekend (bool, optional): Whether to add a weekend indicator. Defaults to False.
-        include_friday_in_weekend (bool, optional): If True, Friday is considered a weekend. Defaults to False.
-        static_covariates (List[str], optional): List of column names to use as static covariates. 
-                                                 These will be preserved in the output DataFrames.
-        cutoff_date (str, optional): Date string to split history and future data. 
-                                     If None, uses the last `forecast_horizon` steps as test.
+        file_path (str): Path to the CSV file.
+        cutoff_date (str): Date string to split train/test (e.g. '2012-08-01').
+        forecast_horizon (int): Number of steps to forecast.
+        target_col (str, optional): Name of target column. If None, tries to infer.
+        time_col (str, optional): Name of time column. If None, tries to infer.
+        static_covariates (List[str], optional): List of static columns (IDs).
+        country (str, optional): Country code for holidays (e.g. 'US', 'GR'). Defaults to 'US'.
 
     Returns:
         Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, MinMaxScaler]: 
@@ -65,43 +59,14 @@ def preprocess_timeseries(
         date_col = cols[0] # Fallback to first column
         
     # Try to find target column
-    target_col = None
-    # If we found date_col, assume next one is target if not specified?
-    # The prompt implies generic, but let's assume the remaining one or 'y' / 'target'
-    # Exclude static_covariates from possible targets if provided
-    possible_targets = [c for c in cols if c != date_col and c not in (static_covariates or [])]
-    
-    # Heuristics for target column name
-    common_target_names = ['y', 'target', 'sales', 'traffic', 'demand', 'attendance', 'weekly_sales']
-    
-    # 1. Check for exact match in common names
-    for name in common_target_names:
-        for col in possible_targets:
-            if col.lower() == name:
-                target_col = col
-                break
-        if target_col:
-            break
-            
-    # 2. If not found, check if only one possible target remains
-    if not target_col:
-        if len(possible_targets) == 1:
-            target_col = possible_targets[0]
+    if target_col is None:
+        if 'y' in cols:
+             target_col = 'y'
+        elif 'target' in cols:
+             target_col = 'target'
         else:
-            # 3. Fallback: Pick the first possible target that is NOT the date column (already filtered)
-            # and preferably not 'id' or 'store' if possible, but we filtered static_covariates.
-            # If we have multiple, we default to the first one.
-            if possible_targets:
-                target_col = possible_targets[0]
-            else:
-                # If absolutely no candidates, fallback to 2nd column if it's not date_col, else 1st
-                # This is a last resort and might still fail if everything is filtered out.
-                if len(cols) > 1 and cols[1] != date_col:
-                    target_col = cols[1]
-                elif cols[0] != date_col:
-                    target_col = cols[0]
-                else:
-                    raise ValueError("Could not identify target column. Please rename target to 'y' or 'target'.")
+             # Strict requirement: User must provide target_col or name it 'y'/'target'
+             raise ValueError("Target column not specified and no 'y' or 'target' column found.")
 
     df = df.rename(columns={date_col: 'timestamp', target_col: 'y'})
     
@@ -128,22 +93,9 @@ def preprocess_timeseries(
     
     # Transform both
     df['y'] = scaler.transform(df[['y']])
-    # We also need to update train_df/test_df if we use them later, but we are modifying df in place/reassigning
-    # Actually, we should be careful. We just updated df['y'].
-    # If we need to scale other covariates, we should do it similarly.
     
     # Infer Frequency
-    freq = pd.infer_freq(df['timestamp'])
-    if not freq:
-        # Simple heuristic if infer_freq fails (e.g. missing data)
-        diff = df['timestamp'].diff().mode()[0]
-        if diff == pd.Timedelta(days=1):
-            freq = 'D'
-        elif diff == pd.Timedelta(hours=1):
-            freq = 'H'
-        # Add more heuristics if needed, or default to 'D'
-        else:
-            freq = 'D' 
+    freq = infer_frequency(df['timestamp']) 
 
     # 3. Infer Covariates & ID Column
     # Identify ID column
@@ -171,25 +123,12 @@ def preprocess_timeseries(
         if 'id_column' not in df.columns:
             if primary_id in df.columns:
                 # Rename primary_id to id_column to avoid duplication
-                # But we must ensure we don't lose the original name if it's used elsewhere?
-                # The user wants to avoid creating 'Store' if it's not required.
-                # If we rename, 'Store' is gone.
-                # But 'Store' is in static_covariates list.
-                # If we rename, we should update static_covariates?
-                # Actually, if we rename, we should just use 'id_column' as the static feature name.
-                # But the user passes static_cov_cols=['id_column'] in the notebook.
-                # So renaming is correct.
                 df = df.rename(columns={primary_id: 'id_column'})
                 # Ensure it is string
                 df['id_column'] = df['id_column'].astype(str)
             else:
-                # Should have been handled above
                 pass
                 
-        # Ensure all static covariates are strings or categorical?
-        # If they are used as static features in the model, they should be preserved.
-        # We don't rename them away, just ensure id_column exists.
-        
     elif 'id_column' not in df.columns:
         df['id_column'] = "0" # Default ID as string
         
@@ -213,15 +152,6 @@ def preprocess_timeseries(
              categorical_covariates.append(col)
 
     # Normalize continuous covariates using training stats
-    # We need to fit a scaler for EACH covariate or use one scaler for all if they are similar?
-    # Usually separate scalers or one StandardScaler for the matrix.
-    # But we are returning only ONE scaler (for y?).
-    # The user said "Validation/testing data should be normalized with the training data stats (mean and std)!"
-    # And "return data, pred_input, scaler".
-    # If we scale covariates, we should probably keep their scalers or just apply the transformation.
-    # Since we only return one scaler, I assume it's primarily for the target 'y' inverse transform.
-    # For covariates, we just transform them in the dataframe and don't return their scalers (unless requested).
-    
     for col in continuous_covariates:
         # Fit on training part
         if cutoff_date:
@@ -232,7 +162,10 @@ def preprocess_timeseries(
         mean = train_vals.mean()
         std = train_vals.std()
         
-        if std != 0:
+        if std == 0 or np.isnan(std):
+            print(f"Warning: Column '{col}' has zero variance, using constant value {mean}")
+            df[col] = 0  # Center constant columns at 0
+        else:
             df[col] = (df[col] - mean) / std
             
     # 4. Time Covariates
@@ -248,6 +181,8 @@ def preprocess_timeseries(
             else:
                 # Fallback for older versions if country_holidays not present (though dir showed it is)
                 country_holidays = getattr(holidays, country)()
+        except AttributeError:
+             raise ValueError(f"Country '{country}' not supported by holidays library (AttributeError).")
         except Exception as e:
              # Fallback or re-raise if country is invalid
              raise ValueError(f"Invalid country '{country}' for holidays: {e}")
@@ -261,8 +196,6 @@ def preprocess_timeseries(
         time_covariates.append('is_weekend')
 
     # Cyclic Encodings for Hour
-    # Check if frequency is hourly
-    # Handle 'h' or 'H' or '1H' etc.
     if freq and (freq == 'H' or freq == 'h' or 'H' in str(freq) or 'h' in str(freq)):
         df['hour_sin'] = np.sin(2 * np.pi * df['timestamp'].dt.hour / 24)
         df['hour_cos'] = np.cos(2 * np.pi * df['timestamp'].dt.hour / 24)
@@ -285,8 +218,10 @@ def preprocess_timeseries(
     if future_data.empty:
         raise ValueError("No data found after cutoff_date. Cannot create future inputs.")
         
-    # Use all available future data (known covariates)
-    # future_data = future_data.iloc[:forecast_horizon].copy() # Removed slicing
+    # Use all available future data (known covariates) UP TO forecast_horizon
+    # This prevents using excessive future data which might not be available in real scenarios
+    # or just to keep pred_input concise.
+    future_data = future_data.iloc[:forecast_horizon].copy()
     
     # Mask target in future (avoid leakage)
     future_data['y'] = 0
@@ -306,6 +241,43 @@ def preprocess_timeseries(
     # So test_df has scaled y.
     
     return data, pred_input, test_df, scaler
+
+
+def infer_frequency(series: pd.Series) -> str:
+    """
+    Robustly infer frequency from a pandas Series of timestamps.
+    
+    Args:
+        series (pd.Series): Series of datetime objects.
+        
+    Returns:
+        str: Frequency string (e.g. 'D', 'H', 'W', 'M').
+    """
+    freq = pd.infer_freq(series)
+    if freq:
+        return freq
+    
+    # Heuristics
+    if len(series) < 2:
+        return 'D' # Default
+        
+    diff = series.diff().mode()[0]
+    if diff >= pd.Timedelta(days=28): return 'M'
+    elif diff >= pd.Timedelta(days=7): return 'W'
+    elif diff >= pd.Timedelta(days=1): return 'D'
+    elif diff >= pd.Timedelta(hours=1): return 'H'
+    
+    return 'D' # Default Fallback
+
+def get_freq_unit(freq_str: str) -> str:
+    """Map frequency code to human readable unit."""
+    if not freq_str: return "steps"
+    freq_upper = str(freq_str).upper()
+    if 'H' in freq_upper: return "hours"
+    elif 'D' in freq_upper: return "days"
+    elif 'W' in freq_upper: return "weeks"
+    elif 'M' in freq_upper: return "months"
+    return "steps"
 
 
 def plot_probabilistic_forecast(
@@ -370,9 +342,21 @@ def plot_probabilistic_forecast(
         history_df_plot[target_col] = scaler.inverse_transform(history_df_plot[[target_col]]).flatten()
         
         # Inverse transform forecast columns
-        for q in ['q10', 'q50', 'q90']:
-            if q in forecast_df_plot.columns:
-                forecast_df_plot[q] = scaler.inverse_transform(forecast_df_plot[[q]]).flatten()
+        scale_cols = ['q10', 'q50', 'q90']
+    
+        # Validation: Check if required columns are present
+        missing = [c for c in scale_cols if c not in forecast_df.columns]
+        if missing:
+            # Check if maybe user has custom quantiles and column names differ
+            # Use basic q50 check at least
+            if 'q50' not in forecast_df.columns:
+                 raise ValueError(f"Forecast dataframe missing required quantile columns. Missing: {missing}")
+            else:
+                 print(f"Warning: Missing some quantile columns {missing}, plotting available ones.")
+                 scale_cols = [c for c in scale_cols if c in forecast_df.columns]
+        
+        for q in scale_cols:
+            forecast_df_plot[q] = scaler.inverse_transform(forecast_df_plot[[q]]).flatten()
                 
         # Inverse transform actuals
         if actual_df_plot is not None:
@@ -411,31 +395,9 @@ def plot_probabilistic_forecast(
             series_history[time_col] = pd.to_datetime(series_history[time_col])
             x_history = series_history[time_col]
             last_date = series_history[time_col].iloc[-1]
-            freq = pd.infer_freq(x_history)
-        else:
-            # Fallback
-            series_history['timestamp'] = pd.to_datetime(series_history['timestamp'])
-            x_history = series_history['timestamp']
-            last_date = series_history['timestamp'].iloc[-1]
-            freq = pd.infer_freq(x_history)
-            
-        # Infer frequency unit for title
-        freq_unit = "steps"
-        if freq:
-            freq_upper = freq.upper()
-            if 'H' in freq_upper: freq_unit = "hours"
-            elif 'D' in freq_upper: freq_unit = "days"
-            elif 'W' in freq_upper: freq_unit = "weeks"
-            elif 'M' in freq_upper: freq_unit = "months"
-        else:
-             # Fallback heuristic
-            if len(x_history) > 1:
-                diff = x_history.diff().mode()[0]
-                if diff >= pd.Timedelta(days=28): freq_unit = "months"
-                elif diff >= pd.Timedelta(days=7): freq_unit = "weeks"
-                elif diff >= pd.Timedelta(days=1): freq_unit = "days"
-                elif diff >= pd.Timedelta(hours=1): freq_unit = "hours"
-            freq = 'D' # Default
+        # Infer frequency
+        freq = infer_frequency(x_history)
+        freq_unit = get_freq_unit(freq)
 
         if freq:
             try:

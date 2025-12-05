@@ -1,6 +1,12 @@
 import keras
 from keras import layers, ops
-from typing import List, Dict, Optional, Tuple
+try:
+    from keras.preprocessing import timeseries_dataset_from_array
+except ImportError:
+    from tensorflow.keras.preprocessing import timeseries_dataset_from_array
+
+import tensorflow as tf
+from typing import List, Dict, Optional, Tuple, Set
 import numpy as np
 import pandas as pd
 from .layers import GatedResidualNetwork, MultivariateVariableSelection, GatedLinearUnit, StaticVariableSelection, InterpretableMultiHeadAttention
@@ -100,7 +106,34 @@ class TFTForecaster:
         # The prompt says "The model should be built upon initialization".
         # So we build it.
         self._build_and_compile_model()
-
+        
+        # Check integer division for attention heads
+        if self.hidden_dim % self.num_heads != 0:
+            print(f"Warning: hidden_dim ({self.hidden_dim}) not divisible by num_heads ({self.num_heads}). "
+                  f"Key dim will be {self.hidden_dim // self.num_heads}.")
+        
+        # Validate indices if provided
+        # We can't validate fully until we know cols, but if user provided dicts, we assume they know what they are doing OR
+        # better validation happens in fit(). here checks are minimal.
+        
+        # Initial validation call
+        if self.static_cov_cols or self.past_cov_cols or self.future_cov_cols: # Only if cols known (usually not at init unless inferred/passed?)
+             # Actually cols are not passed to init. So we can't strict validate here unless we assume defaults.
+             pass
+        # However, we can call it if strict checks are needed later.
+        
+        # User requested call in __init__ or fit. It's in fit.
+        # But let's add it here if consistent.
+        # Problem: self.static_cov_cols is empty at init.
+        # So _validate_categorical_indices() checks len(...) which is 0.
+        # If user passed {0: 10} and len is 0, idx 0 >= 0 -> Raises Error.
+        # So we can ONLY call it if feature counts match?
+        # But num_static_features is passed.
+        # _validate uses len(self.static_cov_cols).
+        # At init, static_cov_cols is []. Length 0.
+        # So calling it here WILL fail if dict is not empty.
+        # So we CANNOT call it in __init__ unless we use num_features instead of col lists.
+        # Let's Skip __init__ call and rely on fit(), but ensure fit() call is robust.
     def _build_and_compile_model(self):
         if self.model is not None:
              return
@@ -173,35 +206,42 @@ class TFTForecaster:
             future_weights = layers.Lambda(lambda x: ops.zeros((ops.shape(x)[0], 0)))(input_future)
 
         # 2. LSTM Encoder-Decoder (Seq2Seq)
-        lstm_layer = layers.LSTM(self.hidden_dim, return_sequences=True, return_state=True)
+        # Explicitly create shared LSTM layer for correct weight sharing
+        lstm_shared = layers.LSTM(self.hidden_dim, return_sequences=True, return_state=True, name="lstm_shared")
         
-        # Initialize LSTM state with c_h, c_c
-
         # Static Enrichment for Past (use c_e)
         x_past = GatedResidualNetwork(self.hidden_dim, self.dropout_rate, name="grn_enrich_past")([x_past, c_e])
         
-        # Run LSTM on Past
-        encoder_out, state_h, state_c = lstm_layer(x_past, initial_state=[c_h, c_c])
-        
-        # Post-LSTM Gate (GLU) + Add + Norm
-        encoder_out = GatedLinearUnit(self.hidden_dim, self.dropout_rate)(encoder_out)
-        encoder_out = layers.LayerNormalization()(encoder_out + x_past) # Residual from x_past
-
         # Static Enrichment for Future (use c_e)
         x_fut = GatedResidualNetwork(self.hidden_dim, self.dropout_rate, name="grn_enrich_fut")([x_fut, c_e])
 
-        # Run LSTM on Future
-        # We initialize with encoder state
-        decoder_out, _, _ = lstm_layer(x_fut, initial_state=[state_h, state_c])
+        # Concatenate for full sequence LSTM processing
+        # This ensures proper state passing from past to future without manual state management quirks
+        x_all = ops.concatenate([x_past, x_fut], axis=1)
         
-        # Post-LSTM Gate + Add + Norm
-        decoder_out = GatedLinearUnit(self.hidden_dim, self.dropout_rate)(decoder_out)
-        decoder_out = layers.LayerNormalization()(decoder_out + x_fut)
+        # Run LSTM on full sequence (Past + Future)
+        # Initialize with static context
+        all_lstm_out, _, _ = lstm_shared(x_all, initial_state=[c_h, c_c])
+        
+        # Split back into encoder and decoder parts
+        encoder_out_raw = all_lstm_out[:, :self.input_len, :]
+        decoder_out_raw = all_lstm_out[:, self.input_len:, :]
+        
+        # Post-LSTM Gate (GLU) + Add + Norm for Encoder
+        encoder_out = GatedLinearUnit(self.hidden_dim, self.dropout_rate)(encoder_out_raw)
+        encoder_out = layers.LayerNormalization()(encoder_out + x_past) # Residual from x_past
+
+        # Post-LSTM Gate + Add + Norm for Decoder
+        decoder_out = GatedLinearUnit(self.hidden_dim, self.dropout_rate)(decoder_out_raw)
+        decoder_out = layers.LayerNormalization()(decoder_out + x_fut) # Residual from x_fut
 
         # 3. Multi-Head Attention (Interpretable)
         # Returns (output, weights) if return_attention_scores=True
+        # Use hidden_dim // num_heads for key_dim to maintain standard MHA dimensionality
+        # and ensure concatenation results in hidden_dim (roughly) or at least controllable projection
         attn_layer = InterpretableMultiHeadAttention(
-            num_heads=self.num_heads, key_dim=self.hidden_dim, dropout=self.dropout_rate
+            num_heads=self.num_heads, key_dim=self.hidden_dim // self.num_heads, 
+            dropout=self.dropout_rate, output_dim=self.hidden_dim
         )
         attn_out, attn_weights = attn_layer(
             query=decoder_out, value=encoder_out, key=encoder_out, return_attention_scores=True
@@ -253,8 +293,6 @@ class TFTForecaster:
                  opt = self.optimizer_name
 
         self.model.compile(optimizer=opt, loss=QuantileLoss(self.quantiles))
-        # self.explain_model is already set? No, we need to set it.
-        self.explain_model = keras.Model(inputs=inputs, outputs=explain_outputs)
 
 
     def get_feature_importance(self, df: pd.DataFrame):
@@ -336,6 +374,258 @@ class TFTForecaster:
         
         return past_imp, fut_imp
 
+    def _get_categorical_cols(self) -> Set[str]:
+        past_cols = list(dict.fromkeys([self.target_col] + self.past_cov_cols + self.future_cov_cols))
+        fut_cols = self.future_cov_cols
+        static_cols = self.static_cov_cols
+        
+        categorical_cols = set()
+        
+        # Static
+        for idx in self.static_categorical_dict.keys():
+            if idx < len(static_cols):
+                categorical_cols.add(static_cols[idx])
+                
+        # Past
+        for idx in self.past_categorical_dict.keys():
+            if idx < len(past_cols):
+                categorical_cols.add(past_cols[idx])
+                
+        # Future
+        for idx in self.future_categorical_dict.keys():
+            if idx < len(fut_cols):
+                categorical_cols.add(fut_cols[idx])
+                
+        return categorical_cols
+
+    def _validate_categorical_indices(self):
+        """Validates that configured categorical indices are within bounds of feature arrays."""
+        # Static
+        static_len = len(self.static_cov_cols)
+        for idx in self.static_categorical_dict.keys():
+            if idx >= static_len:
+                raise ValueError(f"Static categorical index {idx} out of range for {static_len} static features.")
+
+        # Past (includes target + past + future in that order for matrix construction)
+        # Note: Past VSN inputs depends on how we construct the array.
+        # In this implementation, specific indices are mapped in `call` layers.
+        # But `num_past_features` usually implies the width of the past input.
+        # Our `_create_tft_dataset` constructs past_input of width `len(past_cols)`.
+        past_cols = list(dict.fromkeys([self.target_col] + self.past_cov_cols + self.future_cov_cols))
+        past_len = len(past_cols)
+        for idx in self.past_categorical_dict.keys():
+            if idx >= past_len:
+                raise ValueError(f"Past categorical index {idx} out of range for {past_len} past features.")
+
+        # Future
+        fut_len = len(self.future_cov_cols)
+        for idx in self.future_categorical_dict.keys():
+            if idx >= fut_len:
+                raise ValueError(f"Future categorical index {idx} out of range for {fut_len} future features.")
+
+    def _validate_categorical_values(self, df: pd.DataFrame):
+        """
+        Validates that categorical column values in the dataframe are within the configured vocabulary bounds.
+        
+        Args:
+            df (pd.DataFrame): The dataframe containing categorical columns to check.
+            
+        Raises:
+            ValueError: If a value in a categorical column exceeds the size of its corresponding vocabulary.
+        """
+        # Static
+        for idx, vocab in self.static_categorical_dict.items():
+            if idx < len(self.static_cov_cols):
+                col = self.static_cov_cols[idx]
+                if col in df.columns:
+                    max_val = df[col].max()
+                    if max_val >= vocab:
+                        raise ValueError(f"Categorical column '{col}' has value {max_val} >= vocab_size {vocab}")
+        
+        # Past (includes target + past + future)
+        past_cols = list(dict.fromkeys([self.target_col] + self.past_cov_cols + self.future_cov_cols))
+        for idx, vocab in self.past_categorical_dict.items():
+            if idx < len(past_cols):
+                col = past_cols[idx]
+                if col in df.columns:
+                    max_val = df[col].max()
+                    if max_val >= vocab:
+                        raise ValueError(f"Categorical column '{col}' has value {max_val} >= vocab_size {vocab}")
+        
+        # Future
+        for idx, vocab in self.future_categorical_dict.items():
+            if idx < len(self.future_cov_cols):
+                col = self.future_cov_cols[idx]
+                if col in df.columns:
+                    max_val = df[col].max()
+                    if max_val >= vocab:
+                        raise ValueError(f"Categorical column '{col}' has value {max_val} >= vocab_size {vocab}")
+
+    def _create_tft_dataset(
+        self,
+        df: pd.DataFrame,
+        batch_size: int = 32,
+        shuffle: bool = True,
+        seed: Optional[int] = None
+    ) -> tf.data.Dataset:
+        """Creates a TensorFlow Dataset for the TFT model pipeline.
+        
+        This method constructs a highly optimized `tf.data.Dataset` that handles:
+        - Automatic windowing of time series data
+        - Grouping by static covariates for panel data
+        - Broadcasting of static features to all timesteps in a window
+        - Aligning past inputs, future inputs, and target sequences
+        
+        Args:
+            df (pd.DataFrame): Preprocessed dataframe containing all necessary columns 
+                (targets, past/future/static covariates) and scaled values.
+            batch_size (int, optional): Number of samples per batch. Defaults to 32.
+            shuffle (bool, optional): Whether to shuffle the dataset. Defaults to True.
+            seed (int, optional): Random seed for shuffling reproducibility. Defaults to None.
+            
+        Returns:
+            tf.data.Dataset: A dataset yielding tuples of `(inputs, targets)` where:
+                - `inputs`: A tuple/list containing `(past_inputs, future_inputs)` and optionally `static_inputs`.
+                - `targets`: The target sequence for the forecast horizon.
+                
+        Raises:
+            ValueError: If the input dataframe does not contain valid time series segments 
+                longer than `input_chunk_length + output_chunk_length`.
+        """
+            
+        # Derive column indices
+        past_cols = list(dict.fromkeys([self.target_col] + self.past_cov_cols + self.future_cov_cols))
+        fut_cols = self.future_cov_cols
+        static_cols = self.static_cov_cols
+        
+        # Optimization: Sort by static columns + timestamp to ensure contiguous memory blocks for groups
+        if static_cols:
+            sort_cols = static_cols + ['timestamp']
+        else:
+            sort_cols = ['timestamp']
+            
+        # Sort dataframe. This creates a copy but ensures optimal access pattern for subsequent steps.
+        df_sorted = df.sort_values(sort_cols)
+        
+        # Scale (returns new DF)
+        matrix_df = self._scale_matrix(df_sorted, fit=True, categorical_cols=self._get_categorical_cols())
+        
+        col_to_idx = {name: i for i, name in enumerate(matrix_df.columns)}
+        
+        past_idxs = [col_to_idx[c] for c in past_cols]
+        fut_idxs = [col_to_idx[c] for c in fut_cols]
+        static_idxs = [col_to_idx[c] for c in static_cols] if static_cols else []
+        target_idx = col_to_idx[self.target_col]
+        
+        # Convert to float32 numpy array immediately. 
+        # This is the PRIMARY data copy that datasets will view into.
+        data = matrix_df.values.astype('float32')
+        datasets = []
+        
+        # Identify group boundaries
+        if static_cols:
+            # We use groupby size on the SORTED dataframe to get contiguous chunk sizes
+            # sort=False maintains order of appearance (which is sorted order due to df_sorted)
+            group_sizes = df_sorted.groupby(static_cols, sort=False).size()
+            
+            start_idx = 0
+            for group_key, size in group_sizes.items():
+                end_idx = start_idx + size
+                
+                if size >= self.input_len + self.output_len:
+                    # Create VIEW of the data for this group
+                    # Since data is contiguous, this slice is a view, avoiding copy
+                    group_data_view = data[start_idx:end_idx]
+                    
+                    self._make_dataset_from_view(datasets, group_data_view, past_idxs, fut_idxs, target_idx, static_idxs)
+                
+                start_idx = end_idx
+        else:
+            # Single group
+            if len(data) >= self.input_len + self.output_len:
+                self._make_dataset_from_view(datasets, data, past_idxs, fut_idxs, target_idx, static_idxs)
+        
+        if not datasets:
+            err_msg = (f"No valid time series found. Required length: {self.input_len + self.output_len}, "
+                       f"Dataframe rows: {len(df)}")
+            if static_cols:
+                # Need variables from closure? No, group_sizes is local.
+                # Re-calculate group sizes for error message if we want precise count
+                num_groups = df_sorted.groupby(static_cols, sort=False).ngroups
+                err_msg += f", Groups: {num_groups}"
+            raise ValueError(err_msg)
+        
+        # Combine all series
+        if len(datasets) == 1:
+            combined_ds = datasets[0]
+        else:
+            # Interleave for better series mixing
+            # Option 2: Use reduce + concatenate (for sequential chaining)
+            # This is safer than from_tensor_slices which doesn't support list of Datasets
+            combined_ds = datasets[0]
+            for ds in datasets[1:]:
+                combined_ds = combined_ds.concatenate(ds)
+        
+        # Shuffle, batch, prefetch
+        if shuffle:
+            combined_ds = combined_ds.shuffle(buffer_size=10000, seed=seed)
+        
+        combined_ds = combined_ds.batch(batch_size).prefetch(tf.data.AUTOTUNE)
+        
+        return combined_ds
+
+    def _make_dataset_from_view(self, datasets, group_data, past_idxs, fut_idxs, target_idx, static_idxs):
+        """Helper to create and append dataset from a data view."""
+        total_len = len(group_data)
+        
+        # Static features (broadcasted)
+        if static_idxs:
+            static_array = group_data[0, static_idxs] # Already float32
+        
+        # Past sequences
+        past_ds = timeseries_dataset_from_array(
+            data=group_data[:total_len - self.output_len, past_idxs],
+            targets=None,
+            sequence_length=self.input_len,
+            sequence_stride=1,
+            batch_size=None,
+            shuffle=False
+        )
+        
+        # Future sequences
+        future_ds = timeseries_dataset_from_array(
+            data=group_data[self.input_len:, fut_idxs],
+            targets=None,
+            sequence_length=self.output_len,
+            sequence_stride=1,
+            batch_size=None,
+            shuffle=False
+        )
+        
+        # Target sequences
+        target_ds = timeseries_dataset_from_array(
+            data=group_data[self.input_len:, target_idx:target_idx+1],
+            targets=None,
+            sequence_length=self.output_len,
+            sequence_stride=1,
+            batch_size=None,
+            shuffle=False
+        )
+        
+        # Combine
+        if static_idxs:
+            series_ds = tf.data.Dataset.zip((past_ds, future_ds, target_ds)).map(
+                lambda x_past, x_fut, y: ((x_past, x_fut, tf.constant(static_array)), y),
+                num_parallel_calls=tf.data.AUTOTUNE
+            )
+        else:
+            series_ds = tf.data.Dataset.zip((past_ds, future_ds, target_ds)).map(
+                lambda x_past, x_fut, y: ((x_past, x_fut), y),
+                num_parallel_calls=tf.data.AUTOTUNE
+            )
+        
+        datasets.append(series_ds)
+
     def _scale_matrix(self, df: pd.DataFrame, fit: bool = False, categorical_cols: set = None) -> pd.DataFrame:
         """
         Scales the input DataFrame using standard scaling (mean/std).
@@ -380,33 +670,46 @@ class TFTForecaster:
                 val = df[col].values.astype(float)
                 if fit:
                     mean, std = np.mean(val), np.std(val)
-                    if std == 0: std = 1e-7
+                    if std == 0 or np.isnan(std):
+                        print(f"Warning: Column '{col}' has zero variance, centering at 0")
+                        std = 1.0 
+                        # Consistent with utils.py which sets it to 0. 
+                        # casting to (val-mean)/1.0 is equivalent to val-mean since val=mean.
                     self.scalers[col] = (mean, std)
                 
                 if col not in self.scalers:
-                     # If not in scalers (e.g. fit=False and not seen before), raise error
-                     raise ValueError(f"Column {col} not found in fitted scalers.")
-                    
-                mean, std = self.scalers[col]
-                data_dict[col] = (val - mean) / (std + 1e-7)
+                     # Strict check for unseen columns
+                     raise ValueError(f"Column '{col}' not fitted. Available: {list(self.scalers.keys())}")
+                else:
+                    mean, std = self.scalers[col]
+                
+                # Explicit centering for zero variance (std=1.0)
+                data_dict[col] = (val - mean) / std
             
         return pd.DataFrame(data_dict, index=df.index)
 
-    def fit(self, df, target_col, past_cov_cols=None, future_cov_cols=None, static_cov_cols=None, exogenous=None,
-            epochs=10, batch_size=32, verbose=1,
-            validation_split=0.0,
-            use_lr_schedule=True, 
-            use_early_stopping=False, early_stopping_patience=10):
-        """
-        Train the TFT model.
+    def fit(self, df, target_col, past_cov_cols=None, future_cov_cols=None, 
+            static_cov_cols=None, exogenous=None, epochs=10, batch_size=32, 
+            verbose=1, validation_split=0.0, use_lr_schedule=True,
+            use_early_stopping=False, early_stopping_patience=10, seed=None):
+        """Trains the TFT model on the provided time series data.
+
+        This method handles data preparation, creating a `tf.data` pipeline, and fitting the Keras model.
+        It supports automatic feature detection and model rebuilding if the feature configuration changes.
 
         Args:
-            df (pd.DataFrame): Training data containing target, covariates, and static features.
-            target_col (str): Name of the target column.
-            past_cov_cols (List[str], optional): List of past-observed covariate column names. Defaults to None.
-            future_cov_cols (List[str], optional): List of known future covariate column names. Defaults to None.
-            static_cov_cols (List[str], optional): List of static covariate column names. Defaults to None.
-            exogenous (List[str], optional): Alias for future_cov_cols. Defaults to None.
+            df (pd.DataFrame): The training dataframe containing the target and all covariates.
+                Must have a DatetimeIndex or a column named 'timestamp'.
+            target_col (str): The name of the target variable column.
+            past_cov_cols (List[str], optional): List of columns to use as past-observed covariates.
+                Defaults to None.
+            future_cov_cols (List[str], optional): List of columns to use as known future covariates.
+                Defaults to None.
+            static_cov_cols (List[str], optional): List of columns to use as static covariates
+                (e.g., store ID, region). These are used for grouping panel data. Defaults to None.
+            exogenous (List[str], optional): Alias for `future_cov_cols` for backward compatibility.
+                If provided, it overrides `future_cov_cols` and sets `past_cov_cols` to empty.
+                Defaults to None.
             epochs (int, optional): Number of training epochs. Defaults to 10.
             batch_size (int, optional): Batch size. Defaults to 32.
             verbose (int, optional): Verbosity mode. Defaults to 1.
@@ -414,108 +717,49 @@ class TFTForecaster:
             use_lr_schedule (bool, optional): Whether to use ReduceLROnPlateau callback. Defaults to True.
             use_early_stopping (bool, optional): Whether to use EarlyStopping callback. Defaults to False.
             early_stopping_patience (int, optional): Patience for early stopping. Defaults to 10.
+            seed (int, optional): Random seed for reproducibility. Defaults to None.
+        
+        Note:
+            If `fit` is called multiple times with different feature counts, the model will be 
+            rebuilt and initialized from scratch. In this case, any existing categorical 
+            configuration dictionaries will be cleared to prevent inconsistency, and a warning 
+            will be issued.
         """
+        # Validate inputs
+        if target_col not in df.columns:
+            raise ValueError(f"Target column '{target_col}' not found in dataframe. Available: {list(df.columns)}")
         
+        if len(df) < self.input_len + self.output_len:
+            raise ValueError(f"Dataframe too short ({len(df)} rows). Need at least {self.input_len + self.output_len}")
+        
+        # Check for NaN in target
+        if df[target_col].isna().any():
+            raise ValueError(f"Target column '{target_col}' contains NaN values. Please handle them first.")
+            
+        # Feature configs must be set before building
+        # ...
+        
+        # Setup column mappings
         self.target_col = target_col
-        
         if exogenous is not None:
-            # If exogenous is provided, we treat them as future covariates (known in future)
-            # unless specified otherwise. This simplifies the API.
             self.future_cov_cols = exogenous
-            self.past_cov_cols = [] # Implicitly included in past input via future covs
+            self.past_cov_cols = []
         else:
             self.past_cov_cols = past_cov_cols if past_cov_cols else []
             self.future_cov_cols = future_cov_cols if future_cov_cols else []
-            
+        
         self.static_cov_cols = static_cov_cols if static_cov_cols else []
+        self.feature_cols = list(set([target_col] + self.past_cov_cols + 
+                                      self.future_cov_cols + self.static_cov_cols))
         
-        # All columns needed
-        self.feature_cols = list(set([target_col] + self.past_cov_cols + self.future_cov_cols + self.static_cov_cols))
+        # Validate categorical indices against feature counts immediately
+        self._validate_categorical_indices()
         
-        # Identify categorical columns to skip scaling
-        # We map indices from *categorical_dict to column names
-        # Need to determine past_cols and fut_cols first to map indices
-        # Past Input: Target + Past Covs + Future Covs (as observed in past)
-        # Use dict.fromkeys to preserve order and remove duplicates
+        # Derive columns for checks
         past_cols = list(dict.fromkeys([target_col] + self.past_cov_cols + self.future_cov_cols))
         fut_cols = self.future_cov_cols
         static_cols = self.static_cov_cols
-        
-        categorical_cols = set()
-        
-        # Static
-        for idx in self.static_categorical_dict.keys():
-            if idx < len(static_cols):
-                categorical_cols.add(static_cols[idx])
-                
-        # Past
-        for idx in self.past_categorical_dict.keys():
-            if idx < len(past_cols):
-                categorical_cols.add(past_cols[idx])
-                
-        # Future
-        for idx in self.future_categorical_dict.keys():
-            if idx < len(fut_cols):
-                categorical_cols.add(fut_cols[idx])
 
-        # Scale
-        matrix_df = self._scale_matrix(df, fit=True, categorical_cols=categorical_cols)
-        
-        # Create Windows
-        X_past_list, X_fut_list, X_static_list, y_list = [], [], [], []
-        
-        matrix_vals = matrix_df.values
-        col_to_idx = {name: i for i, name in enumerate(matrix_df.columns)}
-        
-        past_idxs = [col_to_idx[c] for c in past_cols]
-        fut_idxs = [col_to_idx[c] for c in fut_cols]
-        static_idxs = [col_to_idx[c] for c in static_cols]
-        target_idx = col_to_idx[target_col]
-        
-        # Helper to create windows from a single series array
-        # Pre-allocate arrays
-        # We need to count total samples first to pre-allocate
-        total_samples = 0
-        
-        if self.static_cov_cols:
-             grouped = matrix_df.groupby(self.static_cov_cols)
-             groups = [group_df.values for _, group_df in grouped]
-        else:
-             groups = [matrix_vals]
-             
-        for series_vals in groups:
-            n = len(series_vals)
-            if n >= self.input_len + self.output_len:
-                total_samples += n - (self.input_len + self.output_len) + 1
-                
-        if total_samples == 0:
-             raise ValueError("No valid windows created. Data might be too short.")
-
-        X_past = np.empty((total_samples, self.input_len, len(past_cols)))
-        X_fut = np.empty((total_samples, self.output_len, len(fut_cols)))
-        X_static = np.empty((total_samples, len(static_cols))) if static_cols else None
-        y = np.empty((total_samples, self.output_len))
-        
-        idx = 0
-        for series_vals in groups:
-            n = len(series_vals)
-            if n < self.input_len + self.output_len:
-                continue
-                
-            num_windows = n - (self.input_len + self.output_len) + 1
-            
-            # Vectorized window creation (stride_tricks could be faster but complex)
-            # Simple loop is faster than append
-            for i in range(num_windows):
-                X_past[idx] = series_vals[i : i+self.input_len, past_idxs]
-                X_fut[idx] = series_vals[i+self.input_len : i+self.input_len+self.output_len, fut_idxs]
-                if static_idxs:
-                    X_static[idx] = series_vals[i, static_idxs]
-                y[idx] = series_vals[i+self.input_len : i+self.input_len+self.output_len, target_idx]
-                idx += 1
-                
-        y = y[..., np.newaxis] # Expand for quantiles
-    
         # Check if we need to rebuild due to feature count mismatch
         current_past = self.num_past_features
         current_future = self.num_future_features
@@ -528,6 +772,17 @@ class TFTForecaster:
         if (current_past != new_past or 
             current_future != new_future or 
             current_static != new_static):
+
+            # Check if we have categorical configs that would be invalidated
+            # Only strictly enforce this if the model was already initialized (counts > 0)
+            initialized = (current_past > 0 or current_future > 0 or current_static > 0)
+            
+            if initialized and (self.past_categorical_dict or self.future_categorical_dict or self.static_categorical_dict):
+                 if verbose > 0:
+                     print("Warning: Clearing categorical dictionaries due to feature count change. Please re-configure if needed.")
+                 self.past_categorical_dict = {}
+                 self.future_categorical_dict = {}
+                 self.static_categorical_dict = {}
 
             if verbose > 0:
                 print(f"WARNING: Feature counts changed. Rebuilding model. "
@@ -544,40 +799,65 @@ class TFTForecaster:
             self._build_and_compile_model()
         
         if self.model is None:
-             # If model was not built at init (e.g. 0 features passed), try to build now?
-             # But we enforced init args.
-             # If user passed 0 at init but now has data, we might need to rebuild or error.
-             # Let's allow rebuilding if not built or if built with 0 features and now we have more?
-             # Simpler: If model is None, build it.
              self.num_past_features = len(past_cols)
              self.num_future_features = len(fut_cols)
              self.num_static_features = len(static_cols)
              self._build_and_compile_model()
-            
-        if verbose > 0:
-            print(f"Training on {len(X_past)} samples.\npast-covariates: {len(past_cols)} | future-covariates: {len(fut_cols)} | static-covariates: {len(static_cols)}")
         
-        inputs = [X_past, X_fut]
-        if static_cols:
-            inputs.append(X_static)
+        # Create tf.data pipeline
+        dataset = self._create_tft_dataset(
+            df=df,
+            batch_size=batch_size,
+            shuffle=True,
+            seed=seed
+        )
+        
+        # Validation split
+        val_dataset = None
+        if validation_split > 0:
+            # Cache the dataset to prevent exhausting the iterator during counting
+            dataset = dataset.cache()
+            
+            # Count total batches safely
+            total_batches = dataset.reduce(0, lambda x, _: x + 1).numpy()
+            val_batches = int(total_batches * validation_split)
+            
+            val_dataset = dataset.take(val_batches)
+            dataset = dataset.skip(val_batches)
         
         # Callbacks
         callbacks = []
         if use_lr_schedule:
-            lr_schedule = keras.callbacks.ReduceLROnPlateau(
-                monitor='loss', factor=0.5, patience=3, min_lr=1e-6, verbose=verbose
-            )
-            callbacks.append(lr_schedule)
+            callbacks.append(tf.keras.callbacks.ReduceLROnPlateau(
+                monitor='val_loss' if val_dataset else 'loss',
+                factor=0.5, patience=3, min_lr=1e-6, verbose=verbose
+            ))
         
         if use_early_stopping:
-            monitor = 'val_loss' if validation_split > 0 else 'loss'
-            early_stop = keras.callbacks.EarlyStopping(
-                monitor=monitor, patience=early_stopping_patience, restore_best_weights=True, verbose=verbose
-            )
-            callbacks.append(early_stop)
-            
-        self.model.fit(inputs, y, epochs=epochs, batch_size=batch_size, verbose=verbose, 
-                       validation_split=validation_split, callbacks=callbacks)
+            callbacks.append(tf.keras.callbacks.EarlyStopping(
+                monitor='val_loss' if val_dataset else 'loss',
+                patience=early_stopping_patience,
+                restore_best_weights=True,
+                verbose=verbose
+            ))
+        
+        # Train
+        if verbose > 0:
+            print(f"Training with tf.data pipeline...")
+            print(f"Past features: {len(past_cols)} | "
+                  f"Future features: {len(fut_cols)} | "
+                  f"Static features: {len(static_cols)}")
+        
+        # Validation: Check categorical max values against vocab bounds
+        self._validate_categorical_values(df)
+                     
+        self.model.fit(
+            dataset,
+            validation_data=val_dataset,
+            epochs=epochs,
+            verbose=verbose,
+            callbacks=callbacks
+        )
 
     def summary(self):
         """
@@ -608,6 +888,15 @@ class TFTForecaster:
         """
         if self.model is None: raise ValueError("Model not fitted.")
         
+        # Validate future covariates are present if expected
+        if self.future_cov_cols:
+            missing = set(self.future_cov_cols) - set(df.columns)
+            if missing:
+                raise ValueError(f"Future covariates missing in prediction data: {missing}")
+                
+        # Validate categorical bounds for prediction data
+        self._validate_categorical_values(df)
+
         # Re-derive categorical cols (should refactor this into a method)
         past_cols = list(dict.fromkeys([self.target_col] + self.past_cov_cols + self.future_cov_cols))
         fut_cols = self.future_cov_cols
@@ -684,11 +973,14 @@ class TFTForecaster:
                 # Create result dict for this group
                 res = {}
                 for i, q in enumerate(self.quantiles):
-                    res[f"q{int(q*100)}"] = pred[:, i]
+                    res[f"q{int(q*100):02d}"] = pred[:, i]
                 
                 res_df = pd.DataFrame(res)
                 # Add Timestamp Index (corresponding to the future horizon)
-                res_df.index = group_df.index[-self.output_len:]
+                if 'timestamp' in group_df.columns:
+                     res_df.index = group_df['timestamp'].iloc[-self.output_len:]
+                else:
+                     res_df.index = group_df.index[-self.output_len:]
                 
                 # Add ID columns
                 if isinstance(group_name, tuple):
@@ -699,7 +991,7 @@ class TFTForecaster:
                     
                 results_list.append(res_df)
                 
-            final_df = pd.concat(results_list, ignore_index=True)
+            final_df = pd.concat(results_list, ignore_index=False)
             return final_df
             
         else:
@@ -707,8 +999,11 @@ class TFTForecaster:
             pred = predict_single(matrix_vals)
             results = {}
             for i, q in enumerate(self.quantiles):
-                results[f"q{int(q*100)}"] = pred[:, i]
+                results[f"q{int(q*100):02d}"] = pred[:, i]
             
             res_df = pd.DataFrame(results)
-            res_df.index = df.index[-self.output_len:]
+            if 'timestamp' in df.columns:
+                 res_df.index = df['timestamp'].iloc[-self.output_len:]
+            else:
+                 res_df.index = df.index[-self.output_len:]
             return res_df

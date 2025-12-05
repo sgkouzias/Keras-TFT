@@ -4,23 +4,9 @@
 ![Keras](https://img.shields.io/badge/keras-3.0%2B-red.svg)
 ![Python](https://img.shields.io/badge/python-3.8%2B-blue.svg)
 
-**A production-ready Keras 3 implementation of Temporal Fusion Transformers for interpretable multi-horizon time series forecasting.**
+# Keras-TFT: Temporal Fusion Transformer
 
-Based on the paper [*Temporal Fusion Transformers for Interpretable Multi-horizon Time Series Forecasting*](https://arxiv.org/abs/1912.09363) by Lim et al. (2020).
-
----
-
-## Overview
-
-Keras TFT provides a highly optimized implementation of the Temporal Fusion Transformer architecture with:
-
-- **Multi-backend support**: Works seamlessly with TensorFlow, JAX, and PyTorch via Keras 3
-- **Production-grade performance**: Optimized data pipelines with 2-3x faster training than naive implementations
-- **Built-in interpretability**: Variable importance scores and attention weight visualization
-- **Panel data support**: Handles multiple time series with static group identifiers
-- **Quantile forecasting**: Produces probabilistic forecasts with uncertainty intervals
-
----
+A production-ready implementation of the Temporal Fusion Transformer (TFT) for interpretable, multi-horizon time series forecasting using **Keras 3**.
 
 ## Features
 
@@ -75,6 +61,16 @@ Keras TFT works with any Keras 3 backend. Configure your preferred backend:
 ```python
 import os
 os.environ['KERAS_BACKEND'] = 'tensorflow'  # or 'jax', 'torch'
+```
+
+**Note for JAX Users:**
+If using the JAX backend with TensorFlow data pipelines (`tf.data`), you must configure TensorFlow to avoid pre-allocating all GPU memory, which would starve the JAX runtime. Add this before importing other libraries:
+
+```python
+import os
+os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"
+import tensorflow as tf
+# ... then import keras_tft
 ```
 
 ---
@@ -197,6 +193,7 @@ Trains the model on time series data.
 - `use_lr_schedule` (bool): Enable ReduceLROnPlateau callback. Default: True.
 - `use_early_stopping` (bool): Enable EarlyStopping callback. Default: False.
 - `early_stopping_patience` (int): Patience for early stopping. Default: 10.
+- `seed` (int, optional): Random seed for reproducibility. Default: None.
 - `verbose` (int): Verbosity mode (0, 1, 2). Default: 1.
 
 **Returns:** None (modifies model in-place).
