@@ -6,7 +6,7 @@
 
 **A production-ready Keras 3 implementation of Temporal Fusion Transformers for interpretable multi-horizon time series forecasting.**
 
-Based on the paper [*Temporal Fusion Transformers for Interpretable Multi-horizon Time Series Forecasting*](https://arxiv.org/abs/1912.09363) by Lim et al. (2021).
+Based on the paper [*Temporal Fusion Transformers for Interpretable Multi-horizon Time Series Forecasting*](https://arxiv.org/abs/1912.09363) by Lim et al. (2020).
 
 ---
 
