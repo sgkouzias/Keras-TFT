@@ -4,8 +4,6 @@
 ![Keras](https://img.shields.io/badge/keras-3.0%2B-red.svg)
 ![Python](https://img.shields.io/badge/python-3.8%2B-blue.svg)
 
-# Keras-TFT: Temporal Fusion Transformer
-
 A production-ready implementation of the Temporal Fusion Transformer (TFT) for interpretable, multi-horizon time series forecasting using **Keras 3**.
 
 ## Features
